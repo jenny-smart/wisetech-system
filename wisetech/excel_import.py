@@ -775,6 +775,7 @@ def staff_names(res: ParseResult) -> list[str]:
             v = c.fields.get(k)
             if not v:
                 continue
+            v = re.sub(r"[（(][^）)]*[）)]", " ", v)          # 「Evia (中衛介紹)」→ Evia
             for part in re.split(r"[、,，/&＆]|\s+", v):
                 part = part.strip()
                 if part and len(part) <= 12 and not re.search(r"\d|等|人$|免|無|解約|Pending|N/A", part, re.I):

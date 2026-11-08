@@ -280,3 +280,75 @@ def contracts_missing_splits(db: DB) -> list[dict]:
                      from contracts k left join companies c on c.id = k.company_id
                      where k.status ilike 'pass%%' and not exists (select 1 from bonus_splits b where b.contract_id = k.id)
                      order by k.contract_no desc nulls last""")
+
+
+# ───────────────────────── 個人進度 ─────────────────────────
+
+_PERSON_MATCH = "~* ('(^|[^A-Za-z])' || %(p)s || '($|[^A-Za-z])')"
+
+
+def person_contracts(db: DB, person: str) -> list[dict]:
+    """這個人參與的所有合約（任何角色），附最後一次送案與各期款項狀態。"""
+    m = _PERSON_MATCH
+    return db.all(f"""
+        select k.id, k.contract_no, c.name as company, k.contract_type, k.program, k.status, k.start_date,
+               k.is_terminated, k.deposit_total, k.approved_amount,
+               (coalesce(k.sales,'') {m} or coalesce(k.partner_sales,'') {m}) as is_sales,
+               (coalesce(k.writer,'') {m} or coalesce(k.main_writer,'') {m}) as is_writer,
+               (coalesce(k.mid_review,'') {m} or coalesce(k.final_review,'') {m}) as is_review,
+               a.attempt_no, a.result, a.submitted_date, a.result_date,
+               (select count(*) from payments p where p.contract_id = k.id and p.stage like '前金%%'
+                  and p.invoice_date is not null) as dep_invoiced,
+               (select count(*) from payments p where p.contract_id = k.id and p.stage like '前金%%'
+                  and p.is_received) as dep_received,
+               (select bool_or(p.invoice_date is not null) from payments p where p.contract_id = k.id and p.stage = '期中') as mid_invoiced,
+               (select bool_or(p.is_received) from payments p where p.contract_id = k.id and p.stage = '期中') as mid_received,
+               (select bool_or(p.invoice_date is not null) from payments p where p.contract_id = k.id and p.stage = '期末') as fin_invoiced,
+               (select bool_or(p.is_received) from payments p where p.contract_id = k.id and p.stage = '期末') as fin_received,
+               (select coalesce(sum(p.invoice_amount),0) from payments p where p.contract_id = k.id
+                  and p.invoice_date is not null and not p.is_received) as outstanding
+        from contracts k
+        left join companies c on c.id = k.company_id
+        left join lateral (select * from applications a where a.contract_id = k.id
+                           order by attempt_no desc limit 1) a on true
+        where coalesce(k.sales,'') {m} or coalesce(k.partner_sales,'') {m} or coalesce(k.writer,'') {m}
+           or coalesce(k.main_writer,'') {m} or coalesce(k.mid_review,'') {m} or coalesce(k.final_review,'') {m}
+           or coalesce(k.outsource,'') {m}
+        order by k.start_date desc nulls last, k.contract_no desc""", {"p": person})
+
+
+def is_live(r: dict) -> bool:
+    """進行中：未解約、未撤案、未全部結清，且近 3 年的案子（或還有待收款）。"""
+    if r["is_terminated"] or r["result"] == "撤案":
+        return False
+    if r["result"] == "Pass" and r["mid_received"] and r["fin_received"]:
+        return False
+    recent = r["start_date"] is None or (date.today() - r["start_date"]).days <= 3 * 365
+    return recent or (r["outstanding"] or 0) > 0
+
+
+def result_year(r: dict) -> int | None:
+    d = r.get("result_date") or r.get("submitted_date") or r.get("start_date")
+    return d.year if d else None
+
+
+def team_overview(db: DB) -> list[dict]:
+    """全員總表：每個在職人員的進行中案件、待收款、應發獎金。"""
+    out = []
+    for name in staff(db):
+        rows = person_contracts(db, name)
+        live = [r for r in rows if is_live(r)]
+        due = db.val("select coalesce(sum(amount),0) from bonus_due where person = %s and not is_paid", (name,))
+        out.append({
+            "person": name,
+            "writing": sum(1 for r in live if r["is_writer"] and r["result"] in ("撰寫中",)),
+            "reviewing": sum(1 for r in live if r["result"] == "審查中" and r["is_writer"]),
+            "fail_open": sum(1 for r in live if r["result"] == "Fail" and (r["is_writer"] or r["is_sales"])),
+            "pass_ytd": sum(1 for r in rows if r["result"] == "Pass" and result_year(r) == date.today().year),
+            "outstanding": sum(r["outstanding"] or 0 for r in live if r["is_sales"]),
+            "review_open": sum(1 for r in live if r["is_review"] and r["result"] == "Pass"
+                               and not (r["mid_received"] and r["fin_received"])),
+            "bonus_due": due,
+            "total": len(rows),
+        })
+    return [o for o in out if o["total"]]

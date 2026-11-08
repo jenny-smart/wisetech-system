@@ -4,7 +4,7 @@
 """
 import streamlit as st
 
-from app_pages import admin, companies, contract, data_import, work
+from app_pages import admin, companies, contract, data_import, progress, work
 from wisetech import ui
 from wisetech.auth import ROLE_LABEL, current_user, login_screen, logout
 
@@ -30,6 +30,7 @@ def main():
     P["company"] = st.Page(companies.detail_page, title="公司資料", icon="🏢", url_path="company")
     P["contracts"] = st.Page(work.contracts_page, title="合約總覽", icon="📄", url_path="contracts")
     P["contract"] = st.Page(contract.page, title="合約", icon="📝", url_path="contract")
+    P["progress"] = st.Page(progress.page, title="個人進度", icon="👥", url_path="progress")
     P["todo"] = st.Page(work.todo_page, title="待辦", icon="✅", url_path="todo")
     P["shipments"] = st.Page(work.shipments_page, title="寄件／用印", icon="📮", url_path="shipments")
     P["taxid"] = st.Page(admin.taxid_page, title="統編確認", icon="🧾", url_path="taxid")
@@ -38,7 +39,7 @@ def main():
     P["import"] = st.Page(data_import.page, title="資料匯入", icon="📥", url_path="import")
 
     role = user["role"]
-    nav = {"查詢": [P["search"], P["company"], P["contracts"], P["contract"]]}
+    nav = {"查詢": [P["search"], P["company"], P["contracts"], P["contract"], P["progress"]]}
     if role in ("admin", "staff"):
         nav["作業"] = [P["todo"], P["shipments"], P["taxid"]]
     if role in ("admin", "sales"):
