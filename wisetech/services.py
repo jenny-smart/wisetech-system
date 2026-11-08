@@ -192,56 +192,71 @@ def failed_open(db: DB) -> list[dict]:
                      order by a.result_date desc nulls last""")
 
 
-# ───────────────────────── 分潤 ─────────────────────────
+# ───────────────────────── 獎金 ─────────────────────────
 
-BONUS_ROLES = ["業務", "主寫", "管考", "行政", "委外", "外部佣金", "獎金池"]
-BONUS_SCOPES = ["頭款", "過案款", "全部"]
-BONUS_TEMPLATES = {
-    "業務 30／主寫 60／管考 10": [("業務", 30), ("主寫", 60), ("管考", 10)],
-    "業務 60／主寫 40": [("業務", 60), ("主寫", 40)],
-    "業務 100": [("業務", 100)],
+ROLE_SUGGESTIONS = ["Sales", "主寫", "管考", "行政", "委外"]
+PERF_TEMPLATES = {
+    "個案：Sales 30／主寫 60／管考 10": [("Sales", 30), ("主寫", 60), ("管考", 10)],
+    "天使：Sales 60／主寫 40": [("Sales", 60), ("主寫", 40)],
+    "投抵：Sales 20／主寫 80": [("Sales", 20), ("主寫", 80)],
+    "青艦：管考 10": [("管考", 10)],
 }
 
 
 def bonus_splits(db: DB, kid: int) -> list[dict]:
-    return db.all("select * from bonus_splits where contract_id = %s order by "
-                  "array_position(array['頭款','過案款','全部'], scope), id", (kid,))
+    return db.all("select * from bonus_splits where contract_id = %s order by id", (kid,))
 
 
 def replace_bonus_splits(db: DB, kid: int, rows: list[dict]):
     with db.tx():
         db.run("delete from bonus_splits where contract_id = %s", (kid,))
         for r in rows:
-            db.insert("bonus_splits", {"contract_id": kid, **r})
+            db.insert("bonus_splits", {"contract_id": kid, "scope": "績效", **r})
 
 
-def bonus_allocations(db: DB, person: str | None = None, start=None, end=None,
-                      contract_id: int | None = None) -> list[dict]:
+def bonus_due(db: DB, *, person=None, unpaid_only=False, contract_id=None) -> list[dict]:
     where, params = ["true"], []
-    if contract_id:
-        where.append("contract_id = %s")
-        params.append(contract_id)
     if person:
         where.append("person = %s")
         params.append(person)
-    if start:
-        where.append("received_date >= %s")
-        params.append(start)
-    if end:
-        where.append("received_date <= %s")
-        params.append(end)
-    return db.all(f"select * from bonus_allocations where {' and '.join(where)} "
-                  "order by received_date desc nulls last, contract_no", params)
+    if unpaid_only:
+        where.append("not is_paid")
+    if contract_id:
+        where.append("contract_id = %s")
+        params.append(contract_id)
+    return db.all(f"select * from bonus_due where {' and '.join(where)} "
+                  "order by is_paid, received_date desc nulls last", params)
 
 
-def contracts_missing_splits(db: DB) -> list[dict]:
-    """有已入帳款項、但還沒設定分潤的合約。"""
-    return db.all("""select distinct k.id, k.contract_no, c.name as company, coalesce(k.partner_sales,k.sales) as sales,
-                            k.writer
-                     from contracts k left join companies c on c.id = k.company_id
-                     join payments p on p.contract_id = k.id and p.is_received
-                     where not exists (select 1 from bonus_splits b where b.contract_id = k.id)
-                     order by k.contract_no desc nulls last""")
+def mark_bonus_paid(db: DB, rows: list[dict], paid_date):
+    with db.tx():
+        for r in rows:
+            db.insert("bonus_disbursements", {"contract_id": r["contract_id"], "payment_id": r["payment_id"],
+                                              "kind": r["kind"], "person": r["person"], "amount": r["amount"],
+                                              "paid_date": paid_date})
+
+
+def disbursements(db: DB, *, person=None, start=None, end=None, contract_id=None) -> list[dict]:
+    where, params = ["true"], []
+    for cond, val in (("d.person = %s", person), ("d.paid_date >= %s", start), ("d.paid_date <= %s", end),
+                      ("d.contract_id = %s", contract_id)):
+        if val:
+            where.append(cond)
+            params.append(val)
+    return db.all(f"""select d.*, k.contract_no, c.name as company from bonus_disbursements d
+                      left join contracts k on k.id = d.contract_id left join companies c on c.id = k.company_id
+                      where {' and '.join(where)} order by d.paid_date desc nulls last, d.id desc""", params)
+
+
+def performance(db: DB, *, person=None, start=None, end=None, contract_id=None) -> list[dict]:
+    where, params = ["true"], []
+    for cond, val in (("person = %s", person), ("perf_date >= %s", start), ("perf_date <= %s", end),
+                      ("contract_id = %s", contract_id)):
+        if val:
+            where.append(cond)
+            params.append(val)
+    return db.all(f"select * from performance where {' and '.join(where)} order by perf_date desc nulls last",
+                  params)
 
 
 def invoices_of(db: DB, cid: int) -> list[dict]:
@@ -257,3 +272,11 @@ def shipments_of(db: DB, cid: int) -> list[dict]:
 def staff(db: DB, active_only: bool = True) -> list[str]:
     return [r["name"] for r in db.all("select name from staff" + (" where active" if active_only else "")
                                       + " order by name")]
+
+
+def contracts_missing_splits(db: DB) -> list[dict]:
+    """已過案、還沒設定績效分配的合約。"""
+    return db.all("""select k.id, k.contract_no, c.name as company, coalesce(k.partner_sales,k.sales) as sales, k.writer
+                     from contracts k left join companies c on c.id = k.company_id
+                     where k.status ilike 'pass%%' and not exists (select 1 from bonus_splits b where b.contract_id = k.id)
+                     order by k.contract_no desc nulls last""")

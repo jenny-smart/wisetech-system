@@ -103,6 +103,8 @@ class ParseResult:
     invoices: list[InvoiceRec] = field(default_factory=list)
     allowances: list[dict] = field(default_factory=list)
     payouts: list[PayoutRec] = field(default_factory=list)
+    disbursements: list[dict] = field(default_factory=list)
+    perf_splits: list[dict] = field(default_factory=list)
     skipped_sheets: list[tuple[str, str]] = field(default_factory=list)
     issues: list[dict] = field(default_factory=list)
 
@@ -574,6 +576,86 @@ def parse_allowance_sheet(ws: Worksheet, res: ParseResult) -> int:
     return n
 
 
+# ───────────────────────── 獎金表（個案／天使／投抵／青艦／發放明細／獎金池） ─────────────────────────
+
+_PCT_HEAD = re.compile(r"^(\d+(?:\.\d+)?)%$")
+
+
+def parse_bonus_sheet(ws: Worksheet, res: ParseResult) -> int:
+    rows = sheet_values(ws)
+    h = None
+    for i in range(min(8, len(rows) - 1)):
+        subs = [header_key(v) for v in rows[i + 1]]
+        if "發放日" in subs and any("公司名稱" in header_key(v) for v in rows[i] + rows[i + 1]):
+            h = i
+            break
+    if h is None:
+        return -1
+    group = _merged_fill(ws, rows, h)
+    sub = rows[h + 1]
+    width = max(len(group), len(sub))
+    G = [header_key(group[i]) if i < len(group) else "" for i in range(width)]
+    S = [header_key(sub[i]) if i < len(sub) else "" for i in range(width)]
+    # 群組欄位往右延伸（沒合併時）
+    last = ""
+    for i in range(width):
+        if G[i]:
+            last = G[i]
+        elif S[i]:
+            G[i] = last
+    name_of = lambda i: G[i] if not S[i] else S[i]  # noqa: E731
+    cno = next((i for i in range(width) if "合約編號" in G[i] or "合約編號" in S[i]), None)
+    comp = next((i for i in range(width) if "公司名稱" in G[i] or "公司名稱" in S[i]), None)
+    writer = next((i for i in range(width) if S[i].startswith("主筆")), None)
+    pairs = []          # (金額欄, 發放日欄, kind)
+    for i in range(width - 1):
+        if S[i + 1] != "發放日" or S[i] in ("發放日",) or "可" in S[i]:
+            continue
+        kind = "獎金池" if "獎金池" in G[i] else "主筆"
+        pairs.append((i, i + 1, kind, S[i] or G[i]))
+    perf = []           # (人名欄, 金額欄, % )
+    for i in range(width - 1):
+        if G[i].startswith("績效結算") and S[i] and not _PCT_HEAD.match(S[i]):
+            m = _PCT_HEAD.match(S[i + 1]) if i + 1 < width else None
+            if m:
+                perf.append((i, i + 1, Decimal(m.group(1)), S[i]))
+    cur_no = cur_comp = cur_writer = None
+    n = 0
+    for r in range(h + 2, len(rows)):
+        vals = rows[r] + [None] * width
+        no = normalize_contract_no(vals[cno]) if cno is not None else None
+        cp = clean_text(vals[comp]) if comp is not None else None
+        if cp:
+            cur_no, cur_comp = no, cp
+        elif no:
+            cur_no = no
+        if not (cur_no or cur_comp):
+            continue
+        w = clean_text(vals[writer]) if writer is not None else None
+        if w:
+            cur_writer = w
+        cname = clean_company_name(cur_comp)["name"] if cur_comp else None
+        for ai, di, kind, label in pairs:
+            amt, _ = parse_amount(vals[ai])
+            pd_raw = clean_text(vals[di])
+            if not amt or amt <= 0:
+                continue
+            d, _ = parse_date(pd_raw)
+            res.disbursements.append({
+                "contract_no": cur_no if cp or not no else no, "company_raw": cur_comp, "company_name": cname,
+                "kind": kind, "person": "獎金池" if kind == "獎金池" else (cur_writer or w),
+                "amount": amt, "paid_date": d or parse_date_prefix(pd_raw), "paid_text": pd_raw,
+                "note": label, "sheet": ws.title, "row": r + 1})
+            n += 1
+        if cp:                                   # 績效只在主列
+            for pi, ai, pct, role in perf:
+                who = clean_text(vals[pi])
+                if who and cur_no:
+                    res.perf_splits.append({"contract_no": cur_no, "company_name": cname, "role": role,
+                                            "person": who, "pct": pct, "sheet": ws.title})
+    return n
+
+
 # ───────────────────────── 入口 ─────────────────────────
 
 SKIP_SHEETS = {"年約"}          # 隱藏的舊年約表欄位錯位，資料已在 108／109 表
@@ -592,6 +674,8 @@ def parse_workbook(path: str, res: ParseResult | None = None) -> ParseResult:
             continue
         n = parse_contract_sheet(ws, res)
         if n >= 0:
+            continue
+        if parse_bonus_sheet(ws, res) >= 0:
             continue
         n = parse_tracking_sheet(ws, res)
         if n >= 0:
@@ -710,4 +794,5 @@ def summary(res: ParseResult) -> dict:
         by_sheet[c.sheet] += 1
     return {"contracts": len(res.contracts), "by_sheet": dict(by_sheet), "shipments": len(res.shipments),
             "invoices": len(res.invoices), "allowances": len(res.allowances),
+            "disbursements": len(res.disbursements), "perf_splits": len(res.perf_splits),
             "payouts": len(res.payouts), "issues": len(res.issues), "skipped": res.skipped_sheets}

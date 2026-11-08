@@ -31,7 +31,7 @@ from wisetech.excel_import import (  # noqa: E402
 )
 from wisetech.parse import name_key, parse_pct, valid_tax_id  # noqa: E402
 
-BUSINESS_TABLES = ["audit_log", "bonus_payouts", "bonus_splits", "shipments", "invoices", "payments", "applications", "contracts",
+BUSINESS_TABLES = ["audit_log", "bonus_disbursements", "bonus_payouts", "bonus_splits", "shipments", "invoices", "payments", "applications", "contracts",
                    "contacts", "taxid_candidates", "company_aliases", "companies"]
 
 
@@ -191,6 +191,57 @@ def load(db: DB, res: ParseResult, groups, reset: bool):
                   where p.invoice_no = i.invoice_no and i.payment_id is null""")
         db.run("""update payments p set is_received = true, received_date = coalesce(p.received_date, i.paid_date)
                   from invoices i where i.payment_id = p.id and i.is_received and not p.is_received""")
+
+        # 合約款項沒填發票金額的，用發票清單的未稅金額補
+        db.run("""update payments p set invoice_amount = i.amount_untaxed,
+                         invoice_date = coalesce(p.invoice_date, i.invoice_date)
+                  from invoices i where i.payment_id = p.id and p.invoice_amount is null and not i.is_void""")
+
+        # 獎金表 → 對到合約
+        by_no = defaultdict(list)
+        for no, lst in contract_ids.items():
+            by_no[no] = lst
+
+        def find_contract(no, cname):
+            cid = company_id.get(key_of.get(cname) or name_key(cname)) if cname else None
+            if no and no in by_no:
+                same = [k for k, c in by_no[no] if c == cid] if cid else []
+                return (same or [by_no[no][0][0]])[0]
+            if cid:
+                ks = db.all("select id from contracts where company_id = %s", (cid,))
+                if len(ks) == 1:
+                    return ks[0]["id"]
+            return None
+
+        seen = set()
+        for d in res.disbursements:
+            kid = find_contract(d["contract_no"], d["company_name"])
+            key = (kid or d["company_name"], d["kind"], d["person"], d["amount"], d["paid_text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            db.insert("bonus_disbursements", {"contract_id": kid, "kind": d["kind"], "person": d["person"],
+                                              "amount": d["amount"], "paid_date": d["paid_date"],
+                                              "paid_text": d["paid_text"], "note": d["note"], "source": "excel",
+                                              "source_sheet": d["sheet"], "source_row": d["row"]})
+            if kid and d["kind"] == "主筆" and d["person"]:
+                db.run("update contracts set main_writer = %s where id = %s and main_writer is null",
+                       (d["person"], kid))
+        seen = set()
+        for sp in res.perf_splits:
+            kid = find_contract(sp["contract_no"], sp["company_name"])
+            role = "Sales" if sp["role"].upper() == "SALES" else sp["role"]
+            if not kid or (kid, role, sp["person"]) in seen:
+                continue
+            seen.add((kid, role, sp["person"]))
+            db.insert("bonus_splits", {"contract_id": kid, "scope": "績效", "role": role, "person": sp["person"],
+                                       "pct": sp["pct"], "note": f"Excel：{sp['sheet']}", "source": "excel"})
+        # 已發放紀錄對到應發的那筆款項（同合約、同類別、金額差 2 元內）
+        db.run("""update bonus_disbursements d set payment_id = (
+                      select b.payment_id from bonus_due b
+                      where b.contract_id = d.contract_id and b.kind = d.kind and abs(b.amount - d.amount) <= 2
+                      limit 1)
+                  where d.payment_id is null and d.contract_id is not null""")
 
         for p in res.payouts:
             db.insert("bonus_payouts", {"person": p.person, "period": p.period, "category": p.category,

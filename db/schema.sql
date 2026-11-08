@@ -205,21 +205,51 @@ create table if not exists shipments (
 create index if not exists shipments_company_idx on shipments (company_id);
 
 -- ───────────────────────── 獎金與績效 ─────────────────────────
--- 每份合約的分潤設定：哪一類款項（頭款／過案款）分給誰、幾 %
--- 例：頭款 Sales 30%／主寫 60%／管考 10%；過案款 Sales 60%／主寫 40%；獎金池用 person = '獎金池'
+-- 獎金規則（每份合約各自設定，預設 5%／5%）：
+--   主筆過案獎金 = 過案款發票（期中／期末／其他）× writer_bonus_pct → 主筆
+--   獎金池       = 同一筆發票 × pool_pct
+--   績效         = 績效基數（過案金額 × 抽成，可手動覆寫）× bonus_splits 各角色 %
+alter table contracts add column if not exists main_writer       text;            -- 主筆（空白時用主寫）
+alter table contracts add column if not exists writer_bonus_pct  numeric not null default 5;
+alter table contracts add column if not exists pool_pct          numeric not null default 5;
+alter table contracts add column if not exists performance_amount numeric;         -- 績效基數覆寫
+alter table contracts add column if not exists performance_date  date;             -- 公文日
+
+-- 績效分配：角色名稱與比例自由設定（業務 30／主寫 60／管考 10…）
 create table if not exists bonus_splits (
     id          bigserial primary key,
     contract_id bigint not null references contracts(id) on delete cascade,
-    scope       text not null default '全部' check (scope in ('頭款','過案款','全部')),
-    role        text not null,                        -- 業務／主寫／管考／行政／委外／外部佣金／獎金池
+    scope       text not null default '績效',
+    role        text not null,
     person      text not null,
-    pct         numeric not null,                     -- 15 = 15%
+    pct         numeric not null,
     note        text,
     source      text not null default 'manual',
     created_at  timestamptz not null default now()
 );
+alter table bonus_splits drop constraint if exists bonus_splits_scope_check;
+alter table bonus_splits alter column scope set default '績效';
 create index if not exists bonus_splits_contract_idx on bonus_splits (contract_id);
 create index if not exists bonus_splits_person_idx on bonus_splits (person);
+
+-- 獎金實際發放紀錄（主筆過案獎金、獎金池、其他）
+create table if not exists bonus_disbursements (
+    id          bigserial primary key,
+    contract_id bigint references contracts(id) on delete cascade,
+    payment_id  bigint references payments(id) on delete set null,
+    kind        text not null,                        -- 主筆／獎金池／其他
+    person      text,
+    amount      numeric,
+    paid_date   date,
+    paid_text   text,
+    note        text,
+    source      text not null default 'manual',
+    source_sheet text,
+    source_row  int,
+    created_at  timestamptz not null default now()
+);
+create index if not exists bonus_disb_contract_idx on bonus_disbursements (contract_id);
+create index if not exists bonus_disb_payment_idx on bonus_disbursements (payment_id);
 
 -- 每季個人獎金（原「績效報表」）
 create table if not exists bonus_payouts (
@@ -270,25 +300,48 @@ left join contracts k on k.company_id = c.id
 left join payments  p on p.contract_id = k.id
 group by c.id;
 
--- 分潤明細：每筆已入帳款項 × 該合約對應的分潤設定
-create or replace view bonus_allocations as
-select p.id as payment_id, k.id as contract_id, k.contract_no, c.name as company,
-       p.stage, case when p.stage like '前金%' then '頭款' else '過案款' end as scope,
-       coalesce(p.received_date, p.invoice_date) as received_date,
-       p.invoice_amount, b.role, b.person, b.pct,
-       round(p.invoice_amount * b.pct / 100) as amount
-from payments p
-join contracts k on k.id = p.contract_id
+drop view if exists bonus_allocations;
+
+-- 應發獎金：每筆已入帳的過案款 → 主筆、獎金池各一列，並標示是否已發
+create or replace view bonus_due as
+with base as (
+    select p.id as payment_id, k.id as contract_id, k.contract_no, c.name as company, p.stage,
+           coalesce(p.received_date, p.invoice_date) as received_date, p.invoice_amount,
+           coalesce(nullif(k.main_writer,''), k.writer) as main_writer, k.writer_bonus_pct, k.pool_pct
+    from payments p join contracts k on k.id = p.contract_id
+    left join companies c on c.id = k.company_id
+    where p.is_received and p.invoice_amount is not null and p.stage in ('期中','期末','其他')
+)
+select b.*, x.kind, x.person, x.pct, round(b.invoice_amount * x.pct / 100) as amount,
+       d.paid_date, d.amount as paid_amount, (d.id is not null) as is_paid
+from base b
+cross join lateral (values ('主筆', b.main_writer, b.writer_bonus_pct),
+                           ('獎金池', '獎金池', b.pool_pct)) as x(kind, person, pct)
+left join lateral (select * from bonus_disbursements d
+                   where d.payment_id = b.payment_id and d.kind = x.kind order by id limit 1) d on true
+where x.pct > 0;
+
+-- 績效：基數 × 各角色 %
+create or replace view performance as
+select k.id as contract_id, k.contract_no, c.name as company, k.contract_type, k.program,
+       coalesce(k.performance_date, k.start_date) as perf_date,
+       coalesce(k.performance_amount,
+                k.approved_amount * nullif(substring(coalesce(k.final_rate, k.mid_rate) from '^\s*([0-9.]+)\s*%?\s*$'), '')::numeric / 100)
+           as base,
+       b.role, b.person, b.pct,
+       round(coalesce(k.performance_amount,
+                k.approved_amount * nullif(substring(coalesce(k.final_rate, k.mid_rate) from '^\s*([0-9.]+)\s*%?\s*$'), '')::numeric / 100)
+             * b.pct / 100) as amount
+from contracts k
 left join companies c on c.id = k.company_id
 join bonus_splits b on b.contract_id = k.id
-     and (b.scope = '全部' or b.scope = case when p.stage like '前金%' then '頭款' else '過案款' end)
-where p.is_received and p.invoice_amount is not null;
+where k.status ilike 'pass%';
 
 -- 資料只透過 Streamlit 伺服器端連線存取：開啟 RLS 且不設任何 policy，
 -- 讓 anon / authenticated 金鑰無法直接讀取（postgres 連線不受 RLS 影響）。
 do $$ declare t text; begin
   foreach t in array array['companies','company_aliases','taxid_candidates','contacts','staff','app_users',
-                           'contracts','applications','payments','invoices','shipments','bonus_splits','bonus_payouts','audit_log'] loop
+                           'contracts','applications','payments','invoices','shipments','bonus_splits','bonus_disbursements','bonus_payouts','audit_log'] loop
     execute format('alter table %I enable row level security', t);
   end loop;
 end $$;

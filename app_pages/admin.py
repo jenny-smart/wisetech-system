@@ -8,7 +8,7 @@ from wisetech import services as sv
 from wisetech.auth import ROLE_LABEL, current_user, hash_pw, is_admin
 from wisetech.parse import valid_tax_id
 from wisetech.taxid import decide, lookup_by_tax_id, search_by_name
-from wisetech.ui import MONEY_COL, TAX_STATUS_LABEL, frame, get_db, go_company
+from wisetech.ui import MONEY_COL, TAX_STATUS_LABEL, frame, get_db, go_company, money
 
 
 # ───────────────────────── 統編確認 ─────────────────────────
@@ -131,43 +131,70 @@ def bonus_page():
             st.warning("你的帳號還沒對應到人員名單，請管理員設定。")
             return
         st.caption(f"只顯示 {person} 的資料")
-    c1, c2 = st.columns(2)
-    today = date.today()
-    q_start = date(today.year, 3 * ((today.month - 1) // 3) + 1, 1)
-    start = c1.date_input("入帳日起", q_start)
-    end = c2.date_input("入帳日迄", today)
 
-    t = st.tabs(["本期分潤（系統計算）", "歷史季獎金（Excel 匯入）"] + (["⚠️ 未設定分潤"] if is_admin() else []))
+    tabs = ["💸 應發未發", "✅ 已發紀錄", "📈 績效", "🗂 歷史季獎金"] + (["⚠️ 未設定績效分配"] if is_admin() else [])
+    t = st.tabs(tabs)
     with t[0]:
-        rows = sv.bonus_allocations(db, person, start, end)
+        rows = sv.bonus_due(db, person=person, unpaid_only=True)
+        st.caption("已入帳的過案款 × 各合約的主筆％／獎金池％，還沒登記發放的。")
         df = frame(rows, {"received_date": "入帳日", "contract_no": "合約", "company": "公司", "stage": "期別",
-                          "invoice_amount": "款項", "role": "角色", "person": "對象", "pct": "%", "amount": "分潤"})
-        if not df.empty:
-            summ = df.groupby(["對象", "角色"], as_index=False)["分潤"].sum()
-            st.dataframe(summ.pivot_table(index="對象", columns="角色", values="分潤", aggfunc="sum", margins=True,
-                                          margins_name="合計").fillna(0),
-                         width="stretch", column_config={c: MONEY_COL for c in summ["角色"].unique()} |
-                         {"合計": MONEY_COL})
-        st.dataframe(df, hide_index=True, width="stretch",
-                     column_config={"款項": MONEY_COL, "分潤": MONEY_COL})
+                          "invoice_amount": "款項", "kind": "類別", "person": "對象", "pct": "%", "amount": "應發"})
+        if df.empty:
+            st.success("沒有待發放的獎金 🎉")
+        else:
+            st.metric("待發合計", money(df["應發"].sum()))
+            if is_admin():
+                df.insert(0, "發放", False)
+                edited = st.data_editor(df, hide_index=True, width="stretch", disabled=list(df.columns[1:]),
+                                        column_config={"款項": MONEY_COL, "應發": MONEY_COL})
+                picked = [rows[i] for i, v in enumerate(edited["發放"]) if v]
+                c1, c2 = st.columns([1, 3])
+                pdate = c1.date_input("發放日", date.today())
+                if picked and c2.button(f"登記 {len(picked)} 筆已發放", type="primary"):
+                    sv.mark_bonus_paid(db, picked, pdate)
+                    db.log(u["username"], "bonus_paid", detail={"n": len(picked)})
+                    st.rerun()
+            else:
+                st.dataframe(df, hide_index=True, width="stretch", column_config={"款項": MONEY_COL, "應發": MONEY_COL})
+
+    c1, c2 = st.columns(2)
     with t[1]:
+        start = st.date_input("發放日起", date(date.today().year, 1, 1), key="d_start")
+        end = st.date_input("發放日迄", date.today(), key="d_end")
+        rows = sv.disbursements(db, person=person, start=start, end=end)
+        df = frame(rows, {"paid_date": "發放日", "contract_no": "合約", "company": "公司", "kind": "類別",
+                          "person": "對象", "amount": "金額", "note": "說明"})
+        if not df.empty:
+            st.dataframe(df.pivot_table(index="對象", columns="類別", values="金額", aggfunc="sum", margins=True,
+                                        margins_name="合計").fillna(0), width="stretch")
+        st.dataframe(df, hide_index=True, width="stretch", column_config={"金額": MONEY_COL})
+    with t[2]:
+        st.caption("過案（Pass）合約的績效基數 × 角色比例，依公文日（未填則用起始日）篩選。")
+        start = st.date_input("起", date(date.today().year, 1, 1), key="p_start")
+        end = st.date_input("迄", date.today(), key="p_end")
+        rows = sv.performance(db, person=person, start=start, end=end)
+        df = frame(rows, {"perf_date": "公文日", "contract_no": "合約", "company": "公司", "contract_type": "類型",
+                          "base": "基數", "role": "角色", "person": "對象", "pct": "%", "amount": "績效"})
+        if not df.empty:
+            st.dataframe(df.pivot_table(index="對象", columns="角色", values="績效", aggfunc="sum", margins=True,
+                                        margins_name="合計").fillna(0), width="stretch")
+        st.dataframe(df, hide_index=True, width="stretch", column_config={"基數": MONEY_COL, "績效": MONEY_COL})
+    with t[3]:
         sql = "select person, period, category, amount, note from bonus_payouts"
         rows = db.all(sql + (" where person = %s" if person else "") + " order by period desc, person",
                       (person,) if person else None)
         df = frame(rows, {"person": "人員", "period": "期間", "category": "類別", "amount": "金額", "note": "備註"})
+        st.caption("Excel「績效報表」的各季過案獎金與獎金池分配。")
         if not df.empty:
             st.dataframe(df.pivot_table(index="期間", columns="人員", values="金額", aggfunc="sum").fillna(0)
                          .sort_index(ascending=False), width="stretch")
-        with st.expander("明細"):
-            st.dataframe(df, hide_index=True, width="stretch", column_config={"金額": MONEY_COL})
     if is_admin():
-        with t[2]:
+        with t[4]:
             miss = sv.contracts_missing_splits(db)
-            st.caption("這些合約已有入帳款項，但還沒設定分潤，所以不會出現在分潤計算中。")
+            st.caption("已過案、但還沒設定績效分配的合約，點進去在「🏆 獎金」分頁設定。")
             ev = st.dataframe(frame(miss, {"contract_no": "合約", "company": "公司", "sales": "業務",
                                            "writer": "主寫"}),
-                              hide_index=True, width="stretch", on_select="rerun",
-                              selection_mode="single-row")
+                              hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row")
             if ev.selection.rows:
                 from wisetech.ui import go_contract
                 go_contract(miss[ev.selection.rows[0]]["id"])

@@ -106,7 +106,7 @@ def _existing(db, k):
 
     tabs = ["📝 送案紀錄", "💰 款項", "📋 合約內容"]
     if is_admin():
-        tabs.append("🏆 分潤")
+        tabs.append("🏆 獎金")
     t = st.tabs(tabs)
     with t[0]:
         _applications(db, k, edit)
@@ -253,44 +253,68 @@ def _contract_form(db, k, edit):
 
 
 def _bonus(db, k):
+    st.markdown("**① 主筆過案獎金與獎金池**　過案款（期中／期末／其他）入帳後，依下面比例計算。")
+    staff = [""] + sv.staff(db)
+    mw = k.get("main_writer") or ""
+    with st.form(f"bonus_pct_{k['id']}"):
+        c1, c2, c3 = st.columns(3)
+        opts = staff if mw in staff else staff + [mw]
+        main_writer = c1.selectbox("主筆（空白＝用主寫）", opts, index=opts.index(mw))
+        wpct = c2.number_input("主筆獎金 %", 0.0, 100.0, float(k.get("writer_bonus_pct") or 0), 0.5)
+        ppct = c3.number_input("獎金池 %", 0.0, 100.0, float(k.get("pool_pct") or 0), 0.5)
+        c1, c2 = st.columns(2)
+        perf_amt = c1.number_input("績效基數（空白＝過案金額 × 期末抽成）", 0.0,
+                                   value=float(k["performance_amount"]) if k.get("performance_amount") else None,
+                                   step=1000.0)
+        perf_date = c2.date_input("公文日", k.get("performance_date"))
+        if st.form_submit_button("💾 儲存"):
+            data = {"main_writer": main_writer or None, "writer_bonus_pct": wpct, "pool_pct": ppct,
+                    "performance_amount": perf_amt or None, "performance_date": perf_date}
+            sv.save_contract(db, data, k["id"])
+            db.log(current_user()["username"], "update_bonus_rule", "contracts", k["id"], data)
+            st.rerun()
+    due = sv.bonus_due(db, contract_id=k["id"])
+    if due:
+        st.dataframe(frame(due, {"received_date": "入帳日", "stage": "期別", "invoice_amount": "款項",
+                                 "kind": "類別", "person": "對象", "pct": "%", "amount": "應發",
+                                 "is_paid": "已發", "paid_date": "發放日"}),
+                     hide_index=True, width="stretch", column_config={"款項": MONEY_COL, "應發": MONEY_COL})
+
+    st.markdown("**② 績效分配**　角色與比例自由設定；合約狀態為 Pass 才計入。")
     rows = sv.bonus_splits(db, k["id"])
-    st.caption("每份合約各自設定。款項標記「已入帳」後，依期別套用：前金1／前金2 → 頭款；期中／期末 → 過案款。")
-    cols = {"id": "id", "scope": "套用於", "role": "角色", "person": "對象", "pct": "%", "note": "備註"}
-    df = frame(rows, cols)
-    c1, c2, c3 = st.columns([2, 1, 1])
-    tpl = c1.selectbox("常用分法", list(sv.BONUS_TEMPLATES), key="bonus_tpl")
-    scope = c2.selectbox("套用於", sv.BONUS_SCOPES, key="bonus_scope")
-    if c3.button("帶入"):
-        who = {"業務": k["partner_sales"] or k["sales"], "主寫": k["writer"],
+    cols = {"id": "id", "role": "角色", "person": "對象", "pct": "%", "note": "備註"}
+    c1, c2 = st.columns([3, 1])
+    tpl = c1.selectbox("常用分法", list(sv.PERF_TEMPLATES), key="perf_tpl")
+    if c2.button("帶入（取代目前設定）"):
+        who = {"Sales": k["partner_sales"] or k["sales"], "主寫": k["writer"],
                "管考": k["mid_review"] or k["final_review"]}
-        add = [{"scope": scope, "role": r, "person": who.get(r) or "", "pct": p} for r, p in sv.BONUS_TEMPLATES[tpl]]
-        sv.replace_bonus_splits(db, k["id"], [{c: r[c] for c in ("scope", "role", "person", "pct", "note")}
-                                              for r in rows] + add)
+        sv.replace_bonus_splits(db, k["id"], [{"role": r, "person": who.get(r) or "（未指定）", "pct": p}
+                                              for r, p in sv.PERF_TEMPLATES[tpl]])
         st.rerun()
-    people = sv.staff(db) + ["獎金池"]
     edited = st.data_editor(
-        df, hide_index=True, width="stretch", num_rows="dynamic", key=f"bonus_{k['id']}",
+        frame(rows, cols), hide_index=True, width="stretch", num_rows="dynamic", key=f"perf_{k['id']}",
         column_config={"id": None,
-                       "套用於": st.column_config.SelectboxColumn(options=sv.BONUS_SCOPES, required=True),
-                       "角色": st.column_config.SelectboxColumn(options=sv.BONUS_ROLES, required=True),
-                       "對象": st.column_config.SelectboxColumn(options=people, required=True),
+                       "角色": st.column_config.TextColumn(help="可自訂，例如：" + "、".join(sv.ROLE_SUGGESTIONS),
+                                                         required=True),
+                       "對象": st.column_config.TextColumn(required=True),
                        "%": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.5, required=True)})
     if not edited.empty:
-        for s, g in edited.groupby("套用於"):
-            total = g["%"].fillna(0).sum()
-            (st.success if abs(total - 100) < 0.01 else st.warning)(f"{s}：合計 {total:g}%")
-        if (edited["對象"].fillna("") == "").any():
-            st.warning("有分潤列還沒指定對象，請在「對象」欄選人（或獎金池）後儲存。")
-    if st.button("💾 儲存分潤設定"):
+        total = edited["%"].fillna(0).sum()
+        (st.success if abs(total - 100) < 0.01 else st.info)(f"合計 {total:g}%")
+    if st.button("💾 儲存績效分配"):
         save_editor(db, "bonus_splits", "contract_id", k["id"], rows, edited,
                     {v: c for c, v in cols.items() if c != "id"}, required=("role", "person", "pct"))
         db.log(current_user()["username"], "update_bonus_splits", "contracts", k["id"])
         st.rerun()
+    perf = sv.performance(db, contract_id=k["id"])
+    if perf:
+        st.caption(f"績效基數 {money(perf[0]['base'])}")
+        st.dataframe(frame(perf, {"role": "角色", "person": "對象", "pct": "%", "amount": "績效"}),
+                     hide_index=True, width="stretch", column_config={"績效": MONEY_COL})
 
-    alloc = sv.bonus_allocations(db, contract_id=k["id"])
-    if alloc:
-        st.markdown("**已入帳款項的分潤**")
-        st.dataframe(frame(alloc, {"received_date": "入帳日", "stage": "期別", "invoice_amount": "款項",
-                                   "role": "角色", "person": "對象", "pct": "%", "amount": "金額"}),
-                     hide_index=True, width="stretch",
-                     column_config={"款項": MONEY_COL, "金額": MONEY_COL})
+    hist = sv.disbursements(db, contract_id=k["id"])
+    if hist:
+        with st.expander(f"獎金發放紀錄（{len(hist)}）"):
+            st.dataframe(frame(hist, {"paid_date": "發放日", "kind": "類別", "person": "對象", "amount": "金額",
+                                      "paid_text": "發放日原文", "note": "說明"}),
+                         hide_index=True, width="stretch", column_config={"金額": MONEY_COL})
