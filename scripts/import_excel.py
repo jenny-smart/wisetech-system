@@ -91,29 +91,41 @@ def write_report(path: Path, res: ParseResult, groups, merges, dup_merges):
             xw, sheet_name="略過的工作表", index=False)
 
 
-def load(db: DB, res: ParseResult, groups, reset: bool):
+def load(db: DB, res: ParseResult, groups, reset: bool, progress=None):
+    """寫入資料庫。全部在同一個交易：中途失敗會整批取消。progress(比例, 說明) 用來顯示進度。"""
+    steps = ["清理舊資料", "公司", "合約", "送案與款項", "寄件與聯絡人", "發票", "獎金紀錄", "收尾"]
+
+    def step(i):
+        if progress:
+            progress(i / len(steps), f"{steps[i]}（{i + 1}/{len(steps)}）")
+
     with db.tx():
+        step(0)
         if reset:
             db.run("truncate " + ", ".join(BUSINESS_TABLES) + " restart identity cascade")
         elif db.val("select count(*) from contracts where source = 'excel'"):
             raise SystemExit("資料庫已經有 Excel 匯入的資料。要重新匯入請加 --reset（會清空所有業務資料）。")
+        db.run("insert into staff (name) select unnest(%s::text[]) on conflict do nothing", (staff_names(res),))
 
-        for n in staff_names(res):
-            db.run("insert into staff (name) values (%s) on conflict do nothing", (n,))
-
-        company_id: dict[str, int] = {}
+        # ── 公司 ──
+        step(1)
         used_tid = {r["tax_id"] for r in db.all("select tax_id from companies where tax_id is not null")}
+        keys, rows = [], []
         for k, g in groups.items():
             tid = g.tax_id if g.tax_id and valid_tax_id(g.tax_id) and g.tax_id not in used_tid else None
             if tid:
                 used_tid.add(tid)
-            cid = db.insert("companies", {"name": g.display, "tax_id": tid,
-                                          "tax_id_status": "confirmed" if tid else "pending",
-                                          "note": "統編取自 Excel 文字" if tid else None})
-            company_id[k] = cid
+            keys.append(k)
+            rows.append({"name": g.display, "tax_id": tid, "tax_id_status": "confirmed" if tid else "pending",
+                         "note": "統編取自 Excel 文字" if tid else None})
+        company_id = dict(zip(keys, db.insert_many("companies", rows, returning=True)))
+        alias_rows, seen_alias = [], set()
+        for k, g in groups.items():
             for alias, mtype in g.aliases.items():
-                db.run("insert into company_aliases (alias, company_id, match_type) values (%s,%s,%s) "
-                       "on conflict (alias) do nothing", (alias, cid, mtype))
+                if alias not in seen_alias:
+                    seen_alias.add(alias)
+                    alias_rows.append({"alias": alias, "company_id": company_id[k], "match_type": mtype})
+        db.insert_many("company_aliases", alias_rows)
 
         key_of = {a: k for k, g in groups.items() for a in g.aliases}
 
@@ -121,37 +133,52 @@ def load(db: DB, res: ParseResult, groups, reset: bool):
             k = key_of.get(raw) or key_of.get(clean) or (name_key(clean) if clean else None)
             return company_id.get(k)
 
-        contract_ids: dict[str, list[tuple[int, int | None]]] = defaultdict(list)
+        # ── 合約 ──
+        step(2)
+        crow, ccid = [], []
         for c in res.contracts:
             cid = cid_for(c.company_raw, c.company_name)
-            data = {"contract_no": c.contract_no, "company_id": cid, "company_raw": c.company_raw,
-                    "name_note": c.name_note, "is_terminated": c.is_terminated, "is_nda": c.is_nda,
-                    "raw": c.raw, "source": "excel", "source_sheet": c.sheet, "source_row": c.row, **c.fields}
-            kid = db.insert("contracts", data)
+            ccid.append(cid)
+            crow.append({"contract_no": c.contract_no, "company_id": cid, "company_raw": c.company_raw,
+                         "name_note": c.name_note, "is_terminated": c.is_terminated, "is_nda": c.is_nda,
+                         "raw": c.raw, "source": "excel", "source_sheet": c.sheet, "source_row": c.row, **c.fields})
+        kids = db.insert_many("contracts", crow, returning=True)
+        contract_ids: dict[str, list[tuple[int, int | None]]] = defaultdict(list)
+        by_company: dict[int, list[int]] = defaultdict(list)
+        for c, kid, cid in zip(res.contracts, kids, ccid):
             if c.contract_no:
                 contract_ids[c.contract_no].append((kid, cid))
-            st = (c.fields.get("status") or "").strip()
-            if c.fields.get("program") or st:
-                result = {"PASS": "Pass", "FAIL": "Fail"}.get(st.upper(), "撤案" if "解約" in st else "審查中")
-                db.insert("applications", {"contract_id": kid, "attempt_no": 1, "program": c.fields.get("program"),
-                                           "submitted_date": c.fields.get("start_date"), "result": result,
-                                           "approved_amount": c.fields.get("approved_amount"),
-                                           "writer": c.fields.get("writer"),
-                                           "note": None if st in ("Pass", "Fail", "In Process", "") else f"原狀態：{st}"})
+            if cid:
+                by_company[cid].append(kid)
+
+        # ── 送案與款項 ──
+        step(3)
+        apps, pays, splits = [], [], []
+        for c, kid in zip(res.contracts, kids):
+            st_ = (c.fields.get("status") or "").strip()
+            if c.fields.get("program") or st_:
+                result = {"PASS": "Pass", "FAIL": "Fail"}.get(st_.upper(), "撤案" if "解約" in st_ else "審查中")
+                apps.append({"contract_id": kid, "attempt_no": 1, "program": c.fields.get("program"),
+                             "submitted_date": c.fields.get("start_date"), "result": result,
+                             "approved_amount": c.fields.get("approved_amount"), "writer": c.fields.get("writer"),
+                             "note": None if st_ in ("Pass", "Fail", "In Process", "") else f"原狀態：{st_}"})
             for p in c.payments:
-                db.insert("payments", {"contract_id": kid, "stage": p.stage, "grant_amount": p.grant_amount,
-                                       "invoice_amount": p.invoice_amount, "invoice_date": p.invoice_date,
-                                       "invoice_no": p.invoice_no, "received_date": p.received_date,
-                                       "is_received": p.is_received, "note": p.note, "raw": p.raw})
+                pays.append({"contract_id": kid, "stage": p.stage, "grant_amount": p.grant_amount,
+                             "invoice_amount": p.invoice_amount, "invoice_date": p.invoice_date,
+                             "invoice_no": p.invoice_no, "received_date": p.received_date,
+                             "is_received": p.is_received, "note": p.note, "raw": p.raw})
             for b in c.bonus:
                 pct = parse_pct(b.get("pct_text"))
-                if pct is None:
-                    continue
-                db.insert("bonus_splits", {"contract_id": kid, "scope": "全部", "person": b["person"],
-                                           "role": "業務" if b["role"] == "Sales" else b["role"],
-                                           "pct": pct, "note": f"Excel：{b.get('pct_text')}", "source": "excel"})
+                if pct is not None:
+                    splits.append({"contract_id": kid, "scope": "績效", "person": b["person"],
+                                   "role": b["role"], "pct": pct, "note": f"Excel：{b.get('pct_text')}",
+                                   "source": "excel"})
+        db.insert_many("applications", apps)
+        db.insert_many("payments", pays)
 
-        contacts: dict[tuple, dict] = {}
+        # ── 寄件與聯絡人 ──
+        step(4)
+        ships, contacts = [], {}
         for s in res.shipments:
             cid = cid_for(s.company_raw, s.company_name)
             f = dict(s.fields)
@@ -163,9 +190,9 @@ def load(db: DB, res: ParseResult, groups, reset: bool):
                 kid = (same or [cands[0][0]])[0]
             email = f.pop("email", None)
             f.pop("tax_id", None)
-            db.insert("shipments", {"company_id": cid, "contract_id": kid, "company_raw": s.company_raw,
-                                    "contract_ref": ref, "raw": s.raw | ({"email": email} if email else {}),
-                                    "source": "excel", "source_row": s.row, **f})
+            ships.append({"company_id": cid, "contract_id": kid, "company_raw": s.company_raw,
+                          "contract_ref": ref, "raw": s.raw | ({"email": email} if email else {}),
+                          "source": "excel", "source_row": s.row, **f})
             if cid and (f.get("contact") or f.get("phone") or email):
                 key = (cid, f.get("contact") or f.get("phone") or email)
                 prev = contacts.get(key)
@@ -173,81 +200,83 @@ def load(db: DB, res: ParseResult, groups, reset: bool):
                     contacts[key] = {"company_id": cid, "name": f.get("contact"), "phone": f.get("phone"),
                                      "email": email, "address": f.get("address"), "last_seen": f.get("sent_date"),
                                      "source": "excel"}
-        for c in contacts.values():
-            db.insert("contacts", c)
+        db.insert_many("shipments", ships)
+        db.insert_many("contacts", list(contacts.values()))
 
+        # ── 發票 ──
+        step(5)
         allow = {a["invoice_no"]: a for a in res.allowances}
-        for i in res.invoices:
-            a = allow.get(i.invoice_no, {})
-            db.insert("invoices", {
-                "invoice_no": i.invoice_no, "company_id": None if i.is_void else cid_for(i.company_raw, i.company_name),
-                "company_raw": i.company_raw, "invoice_date": i.invoice_date, "amount_untaxed": i.amount_untaxed,
-                "amount_taxed": i.amount_taxed, "item": i.item, "paid_text": i.paid_text, "paid_date": i.paid_date,
-                "is_received": i.is_received, "is_void": i.is_void, "remarks": i.remarks,
-                "bonus_period": i.bonus_period, "extra": i.extra, "allowance_amount": a.get("amount"),
-                "allowance_date": a.get("date"), "source": "excel", "source_sheet": i.sheet, "source_row": i.row})
-        # 發票號碼對到合約款項；發票清單上已入帳、合約表沒寫入帳的，補上
+        db.insert_many("invoices", [{
+            "invoice_no": i.invoice_no, "company_id": None if i.is_void else cid_for(i.company_raw, i.company_name),
+            "company_raw": i.company_raw, "invoice_date": i.invoice_date, "amount_untaxed": i.amount_untaxed,
+            "amount_taxed": i.amount_taxed, "item": i.item, "paid_text": i.paid_text, "paid_date": i.paid_date,
+            "is_received": i.is_received, "is_void": i.is_void, "remarks": i.remarks,
+            "bonus_period": i.bonus_period, "extra": i.extra,
+            "allowance_amount": allow.get(i.invoice_no, {}).get("amount"),
+            "allowance_date": allow.get(i.invoice_no, {}).get("date"),
+            "source": "excel", "source_sheet": i.sheet, "source_row": i.row} for i in res.invoices])
+        # 發票號碼對到合約款項；發票清單上已入帳的補到款項；款項沒有發票金額的用未稅金額補
         db.run("""update invoices i set payment_id = p.id from payments p
                   where p.invoice_no = i.invoice_no and i.payment_id is null""")
         db.run("""update payments p set is_received = true, received_date = coalesce(p.received_date, i.paid_date)
                   from invoices i where i.payment_id = p.id and i.is_received and not p.is_received""")
-
-        # 合約款項沒填發票金額的，用發票清單的未稅金額補
         db.run("""update payments p set invoice_amount = i.amount_untaxed,
                          invoice_date = coalesce(p.invoice_date, i.invoice_date)
                   from invoices i where i.payment_id = p.id and p.invoice_amount is null and not i.is_void""")
 
-        # 獎金表 → 對到合約
-        by_no = defaultdict(list)
-        for no, lst in contract_ids.items():
-            by_no[no] = lst
+        # ── 獎金 ──
+        step(6)
 
         def find_contract(no, cname):
             cid = company_id.get(key_of.get(cname) or name_key(cname)) if cname else None
-            if no and no in by_no:
-                same = [k for k, c in by_no[no] if c == cid] if cid else []
-                return (same or [by_no[no][0][0]])[0]
-            if cid:
-                ks = db.all("select id from contracts where company_id = %s", (cid,))
-                if len(ks) == 1:
-                    return ks[0]["id"]
+            if no and no in contract_ids:
+                same = [k for k, c in contract_ids[no] if c == cid] if cid else []
+                return (same or [contract_ids[no][0][0]])[0]
+            if cid and len(by_company.get(cid, [])) == 1:
+                return by_company[cid][0]
             return None
 
-        seen = set()
+        disb, seen, main_writer = [], set(), {}
         for d in res.disbursements:
             kid = find_contract(d["contract_no"], d["company_name"])
             key = (kid or d["company_name"], d["kind"], d["person"], d["amount"], d["paid_text"])
             if key in seen:
                 continue
             seen.add(key)
-            db.insert("bonus_disbursements", {"contract_id": kid, "kind": d["kind"], "person": d["person"],
-                                              "amount": d["amount"], "paid_date": d["paid_date"],
-                                              "paid_text": d["paid_text"], "note": d["note"], "source": "excel",
-                                              "source_sheet": d["sheet"], "source_row": d["row"]})
+            disb.append({"contract_id": kid, "kind": d["kind"], "person": d["person"], "amount": d["amount"],
+                         "paid_date": d["paid_date"], "paid_text": d["paid_text"], "note": d["note"],
+                         "source": "excel", "source_sheet": d["sheet"], "source_row": d["row"]})
             if kid and d["kind"] == "主筆" and d["person"]:
-                db.run("update contracts set main_writer = %s where id = %s and main_writer is null",
-                       (d["person"], kid))
-        seen = set()
+                main_writer.setdefault(kid, d["person"])
+        db.insert_many("bonus_disbursements", disb)
+        if main_writer:
+            db.run("""update contracts k set main_writer = m.w
+                      from unnest(%s::bigint[], %s::text[]) as m(id, w) where k.id = m.id""",
+                   (list(main_writer), list(main_writer.values())))
+        seen = {(s["contract_id"], s["role"], s["person"]) for s in splits}
         for sp in res.perf_splits:
             kid = find_contract(sp["contract_no"], sp["company_name"])
             role = "Sales" if sp["role"].upper() == "SALES" else sp["role"]
-            if not kid or (kid, role, sp["person"]) in seen:
-                continue
-            seen.add((kid, role, sp["person"]))
-            db.insert("bonus_splits", {"contract_id": kid, "scope": "績效", "role": role, "person": sp["person"],
-                                       "pct": sp["pct"], "note": f"Excel：{sp['sheet']}", "source": "excel"})
+            if kid and (kid, role, sp["person"]) not in seen:
+                seen.add((kid, role, sp["person"]))
+                splits.append({"contract_id": kid, "scope": "績效", "role": role, "person": sp["person"],
+                               "pct": sp["pct"], "note": f"Excel：{sp['sheet']}", "source": "excel"})
+        db.insert_many("bonus_splits", splits)
+        db.insert_many("bonus_payouts", [{"person": p.person, "period": p.period, "category": p.category,
+                                          "amount": p.amount, "note": p.note, "source": "excel",
+                                          "source_sheet": p.sheet} for p in res.payouts])
+
+        # ── 收尾 ──
+        step(7)
         # 已發放紀錄對到應發的那筆款項（同合約、同類別、金額差 2 元內）
         db.run("""update bonus_disbursements d set payment_id = (
                       select b.payment_id from bonus_due b
                       where b.contract_id = d.contract_id and b.kind = d.kind and abs(b.amount - d.amount) <= 2
                       limit 1)
                   where d.payment_id is null and d.contract_id is not null""")
-
-        for p in res.payouts:
-            db.insert("bonus_payouts", {"person": p.person, "period": p.period, "category": p.category,
-                                        "amount": p.amount, "note": p.note, "source": "excel",
-                                        "source_sheet": p.sheet})
         db.log("import", "excel_import", detail=summary(res))
+    if progress:
+        progress(1.0, "完成")
 
 
 def main():

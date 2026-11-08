@@ -68,8 +68,9 @@ def _import(db):
         reset = st.checkbox("清空所有業務資料後重新匯入（帳號與人員名單保留，無法復原）")
     confirm = st.text_input("確認匯入請輸入「匯入」")
     if st.button("📥 開始匯入", type="primary", disabled=confirm.strip() != "匯入" or (existing and not reset)):
-        with st.spinner("寫入資料庫…"):
-            load(db, pv["res"], pv["groups"], reset)
+        bar = st.progress(0.0, text="準備寫入…")
+        st.caption("寫入中請不要關閉或重新整理頁面；萬一中斷，資料會整批取消，可以重新匯入。")
+        load(db, pv["res"], pv["groups"], reset, progress=lambda f, msg: bar.progress(f, text=f"寫入{msg}"))
         st.session_state.pop("import_preview")
         st.success("匯入完成！下一步：到「② 批次比對統編」。")
         st.balloons()

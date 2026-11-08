@@ -75,6 +75,25 @@ class DB:
         return self.val(f"insert into {table} ({cols}) values ({ph}) returning {returning}",
                         list(data.values()))
 
+    def insert_many(self, table: str, rows: list[dict], returning: bool = False) -> list:
+        """批次寫入（psycopg pipeline，一次送出），returning=True 時依序回傳 id。"""
+        if not rows:
+            return []
+        cols = list(dict.fromkeys(k for r in rows for k in r))
+        params = [[_adapt(r.get(c)) for c in cols] for r in rows]
+        sql = (f"insert into {table} ({', '.join(cols)}) values ({', '.join(['%s'] * len(cols))})"
+               + (" returning id" if returning else ""))
+        self._ensure()
+        ids = []
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, params, returning=returning)
+            if returning:
+                while True:
+                    ids.append(cur.fetchone()["id"])
+                    if not cur.nextset():
+                        break
+        return ids
+
     def update(self, table: str, id_: int, data: dict) -> int:
         if not data:
             return 0
