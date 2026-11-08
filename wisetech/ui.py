@@ -14,13 +14,18 @@ TAX_STATUS_LABEL = {"pending": "⏳ 未比對", "auto": "🤖 自動比對", "ca
                     "confirmed": "✅ 已確認", "not_found": "⚠️ 查無", "not_applicable": "➖ 非公司"}
 
 
-@st.cache_resource
-def _conn():
-    return connect()
-
-
 def get_db() -> DB:
-    return DB(_conn())
+    """每個瀏覽器分頁（session）各用一條連線。
+
+    不能用 st.cache_resource 共用：兩個人同時寫入（例如匯入），交易會在同一條連線上互相干擾。
+    """
+    db = st.session_state.get("_db")
+    if db is None:
+        db = DB(connect())
+        st.session_state["_db"] = db
+    else:
+        db._ensure()                      # 連線斷掉時自動重連（DB 物件內部替換）
+    return db
 
 
 def money(v) -> str:
