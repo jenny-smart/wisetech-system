@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.streamlit/secrets.toml
+output/
+*.xlsx
+!tests/*.xlsx
+.pytest_cache/
+.DS_Store
