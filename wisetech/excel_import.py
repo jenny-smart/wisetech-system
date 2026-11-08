@@ -17,7 +17,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from .parse import (
     clean_company_name, clean_text, extract_tax_id, find_contract_refs, find_email, find_phone,
     classify_contact_cell, fmt_pct, header_key, name_key, normalize_contract_no, parse_amount,
-    parse_check, parse_date, short_key,
+    parse_check, parse_date, parse_date_prefix, short_key,
 )
 
 # ───────────────────────── 中介資料結構 ─────────────────────────
@@ -76,9 +76,32 @@ class PayoutRec:
 
 
 @dataclass
+class InvoiceRec:
+    sheet: str
+    row: int
+    invoice_no: str
+    company_raw: str | None
+    company_name: str | None
+    invoice_date: date | None
+    amount_untaxed: Decimal | None
+    amount_taxed: Decimal | None
+    item: str | None
+    paid_text: str | None
+    paid_date: date | None
+    is_received: bool
+    remarks: str | None
+    is_void: bool
+    bonus_period: str | None
+    extra: str | None
+    tax_id: str | None
+
+
+@dataclass
 class ParseResult:
     contracts: list[ContractRec] = field(default_factory=list)
     shipments: list[ShipmentRec] = field(default_factory=list)
+    invoices: list[InvoiceRec] = field(default_factory=list)
+    allowances: list[dict] = field(default_factory=list)
     payouts: list[PayoutRec] = field(default_factory=list)
     skipped_sheets: list[tuple[str, str]] = field(default_factory=list)
     issues: list[dict] = field(default_factory=list)
@@ -116,7 +139,7 @@ def _merged_fill(ws: Worksheet, rows: list[list], r: int) -> list:
     return vals
 
 
-GROUPS_WITH_SUBS = ("前金", "期中", "期末", "外部佣金", "績效結算", "獎金分配")
+GROUPS_WITH_SUBS = ("前金", "期中", "期末", "外部佣金", "績效結算", "獎金分配", "管考")
 
 
 def build_headers(ws: Worksheet, rows: list[list], h: int) -> tuple[list[tuple[str, str]], int]:
@@ -151,7 +174,7 @@ def find_header_row(rows: list[list], must: tuple[str, ...], limit: int = 15) ->
 
 SIMPLE_FIELDS = [
     ("業務", "partner_sales"), ("起始日", "start_date"), ("終止日", "end_date"),
-    ("合約類型", "contract_type"), ("前金扣", "deposit_deduct"), ("含稅", "tax_mode"),
+    ("合約類型", "contract_type"), ("年約", "contract_type"), ("前金扣", "deposit_deduct"), ("含稅", "tax_mode"),
     ("送案別", "program"), ("狀態", "status"), ("過案金額", "approved_amount"),
     ("特別約定", "special_terms"),
 ]
@@ -169,6 +192,9 @@ def _received(text: str | None, invoice_date: date | None) -> tuple[date | None,
     d, raw = parse_date(text)
     if d:
         return d, True, None
+    d = parse_date_prefix(raw)
+    if d:
+        return d, True, raw
     m = _MD.match(raw or "")
     if m and invoice_date:
         mo, dd = int(m.group(1)), int(m.group(2))
@@ -300,6 +326,10 @@ def parse_contract_sheet(ws: Worksheet, res: ParseResult) -> int:
                     f["ext_source"] = text
                 else:
                     rec.raw[col] = text
+                continue
+
+            if g.startswith("管考") and s in ("期中", "期末"):
+                f["mid_review" if s == "期中" else "final_review"] = text
                 continue
 
             if g.startswith("績效結算") or g.startswith("獎金分配"):
@@ -480,7 +510,73 @@ def parse_payout_sheet(ws: Worksheet, res: ParseResult) -> int:
     return count
 
 
+# ───────────────────────── 發票清單（109發票…115發票、發票_二聯）與折讓 ─────────────────────────
+
+_QUARTER = re.compile(r"(1\d{2})\s*[.\-]?\s*([1-4])\s*Q", re.I)
+
+
+def parse_invoice_sheet(ws: Worksheet, res: ParseResult) -> int:
+    rows = sheet_values(ws)
+    h = find_header_row(rows, ("發票號碼", "公司名稱", "未稅"))
+    if h is None:
+        return -1
+    heads = [header_key(v) for v in rows[h]]
+    col = {k: heads.index(k) for k in ("發票號碼", "公司名稱", "日期", "未稅", "含稅", "項目", "付款日", "REMARKS")
+           if k in heads}
+    count = 0
+    for r in range(h + 1, len(rows)):
+        vals = rows[r] + [None] * 12
+        g = lambda k: vals[col[k]] if k in col else None  # noqa: E731
+        no = clean_text(g("發票號碼"))
+        comp = clean_text(g("公司名稱"))
+        if not no or not re.match(r"^[A-Z]{2}\s*\d{8}$", no.replace(" ", "")):
+            continue                                   # 月份標題列、「懷思二聯式發票」等
+        no = no.replace(" ", "")
+        void = comp is None or "作廢" in comp or (clean_text(g("付款日")) or "").startswith("作廢")
+        inv_date, _ = parse_date(g("日期"))
+        untaxed, _ = parse_amount(g("未稅"))
+        taxed, _ = parse_amount(g("含稅"))
+        paid = clean_text(g("付款日"))
+        paid_date, received, _ = _received(paid, inv_date)
+        remarks = clean_text(g("REMARKS"))
+        extra = [clean_text(v) for v in vals[max(col.values()) + 1:] if clean_text(v)]
+        q = next((m for m in (_QUARTER.search(x) for x in extra) if m), None)
+        cn = clean_company_name(comp) if not void else {"name": None, "note": None}
+        res.invoices.append(InvoiceRec(
+            sheet=ws.title, row=r + 1, invoice_no=no, company_raw=None if void else comp,
+            company_name=cn["name"], invoice_date=inv_date, amount_untaxed=untaxed, amount_taxed=taxed,
+            item=clean_text(g("項目")), paid_text=paid, paid_date=paid_date,
+            is_received=received and not void, remarks=remarks, is_void=void,
+            bonus_period=f"{q.group(1)} {q.group(2)}Q" if q else None,
+            extra="；".join(extra) or None, tax_id=extract_tax_id(comp)))
+        count += 1
+    return count
+
+
+def parse_allowance_sheet(ws: Worksheet, res: ParseResult) -> int:
+    rows = sheet_values(ws)
+    h = find_header_row(rows, ("折讓日期", "發票號碼"))
+    if h is None:
+        return -1
+    heads = [header_key(v) for v in rows[h]]
+    ci = {k: heads.index(k) for k in ("折讓日期", "公司名稱", "發票號碼", "金額", "合計") if k in heads}
+    n = 0
+    for r in range(h + 1, len(rows)):
+        vals = rows[r] + [None] * 8
+        no = clean_text(vals[ci["發票號碼"]]) if "發票號碼" in ci else None
+        if not no:
+            continue
+        amt, _ = parse_amount(vals[ci["金額"]]) if "金額" in ci else (None, None)
+        d = parse_date_prefix(clean_text(vals[ci["折讓日期"]])) if "折讓日期" in ci else None
+        res.allowances.append({"invoice_no": no.replace(" ", ""), "amount": amt, "date": d,
+                               "raw_date": clean_text(vals[ci["折讓日期"]]) if "折讓日期" in ci else None})
+        n += 1
+    return n
+
+
 # ───────────────────────── 入口 ─────────────────────────
+
+SKIP_SHEETS = {"年約"}          # 隱藏的舊年約表欄位錯位，資料已在 108／109 表
 
 
 def parse_workbook(path: str, res: ParseResult | None = None) -> ParseResult:
@@ -488,6 +584,11 @@ def parse_workbook(path: str, res: ParseResult | None = None) -> ParseResult:
     wb = load_workbook(path, data_only=True)
     for ws in wb.worksheets:
         if ws.sheet_state != "visible" and ws.max_row < 2:
+            continue
+        if ws.title.strip() in SKIP_SHEETS:
+            res.skipped_sheets.append((f"{path.split('/')[-1]} / {ws.title}", "隱藏的舊年約表，資料已在 108／109 表"))
+            continue
+        if parse_invoice_sheet(ws, res) >= 0 or parse_allowance_sheet(ws, res) >= 0:
             continue
         n = parse_contract_sheet(ws, res)
         if n >= 0:
@@ -540,6 +641,9 @@ def group_companies(res: ParseResult) -> tuple[dict[str, CompanyGroup], dict[str
         add(c.company_raw, c.company_name, extract_tax_id(c.company_raw))
     for s in res.shipments:
         add(s.company_raw, s.company_name, s.fields.get("tax_id"))
+    for i in res.invoices:
+        if not i.is_void:
+            add(i.company_raw, i.company_name, i.tax_id)
 
     # 簡稱 → 全名（「睿元」→「睿元國際股份有限公司」），只有唯一候選時才合併
     full_keys = [k for k in groups if short_key(k) != k]
@@ -605,4 +709,5 @@ def summary(res: ParseResult) -> dict:
     for c in res.contracts:
         by_sheet[c.sheet] += 1
     return {"contracts": len(res.contracts), "by_sheet": dict(by_sheet), "shipments": len(res.shipments),
+            "invoices": len(res.invoices), "allowances": len(res.allowances),
             "payouts": len(res.payouts), "issues": len(res.issues), "skipped": res.skipped_sheets}

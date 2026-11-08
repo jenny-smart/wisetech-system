@@ -244,6 +244,12 @@ def contracts_missing_splits(db: DB) -> list[dict]:
                      order by k.contract_no desc nulls last""")
 
 
+def invoices_of(db: DB, cid: int) -> list[dict]:
+    return db.all("""select i.*, k.contract_no from invoices i
+                     left join payments p on p.id = i.payment_id left join contracts k on k.id = p.contract_id
+                     where i.company_id = %s order by i.invoice_date desc nulls last""", (cid,))
+
+
 def shipments_of(db: DB, cid: int) -> list[dict]:
     return db.all("select * from shipments where company_id = %s order by sent_date desc nulls last, id desc", (cid,))
 

@@ -15,7 +15,8 @@ def test_parse_date_formats():
     assert parse_date("1080314") == (date(2019, 3, 14), None)
     assert parse_date(1090105) == (date(2020, 1, 5), None)
     assert parse_date(datetime(2024, 3, 6)) == (date(2024, 3, 6), None)
-    assert parse_date("N/A") == (None, "N/A")
+    assert parse_date("N/A") == (None, None)
+    assert parse_date("待確認") == (None, "待確認")
     assert parse_date("1/2/1900") == (None, "1/2/1900")
     assert parse_date(None) == (None, None)
 
@@ -80,3 +81,10 @@ def test_contract_no():
     assert normalize_contract_no(" 11503-07 ") == "11503-07"
     assert find_contract_refs("合約11203-04/05") == ["11203-04", "11203-05"]
     assert find_contract_refs("na/寄發票") == []
+
+
+def test_date_prefix():
+    from wisetech.parse import parse_date_prefix
+    assert parse_date_prefix("115.1.26 入帳$146,970") == date(2026, 1, 26)
+    assert parse_date_prefix("2020/1/31已升") == date(2020, 1, 31)
+    assert parse_date_prefix("已收") is None

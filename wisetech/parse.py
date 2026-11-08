@@ -39,6 +39,24 @@ def header_key(v) -> str:
 _YMD = re.compile(r"^(\d{2,4})\s*[/.\-年]\s*(\d{1,2})\s*[/.\-月]\s*(\d{1,2})\s*日?$")
 _MDY = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
 _ROC7 = re.compile(r"^(\d{2,3})(\d{2})(\d{2})$")
+_BLANK_WORDS = {"N/A", "NA", "NIL", "無", "NONE", "-"}
+_DATE_PREFIX = re.compile(r"^(\d{2,4})\s*[/.\-]\s*(\d{1,2})\s*[/.\-]\s*(\d{1,2})|^(\d{3})(\d{2})(\d{2})(?!\d)")
+
+
+def parse_date_prefix(text: str | None) -> date | None:
+    """「115.1.26 入帳$146,970」「2020/1/31已升」→ 開頭的日期。"""
+    if not text:
+        return None
+    m = _DATE_PREFIX.match(text.strip())
+    if not m:
+        return None
+    if m.group(1):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        y, mo, d = int(m.group(4)), int(m.group(5)), int(m.group(6))
+    if y < 1900:
+        y += 1911
+    return _mk(y, mo, d)
 
 
 def _mk(y: int, m: int, d: int) -> date | None:
@@ -69,6 +87,8 @@ def parse_date(v) -> tuple[date | None, str | None]:
         return None, None
     if isinstance(v, (int, float)):
         s = str(int(v))
+    if s.upper().replace(" ", "") in _BLANK_WORDS:
+        return None, None
 
     m = _YMD.match(s)
     if m:

@@ -31,7 +31,7 @@ from wisetech.excel_import import (  # noqa: E402
 )
 from wisetech.parse import name_key, parse_pct, valid_tax_id  # noqa: E402
 
-BUSINESS_TABLES = ["audit_log", "bonus_payouts", "bonus_splits", "shipments", "payments", "applications", "contracts",
+BUSINESS_TABLES = ["audit_log", "bonus_payouts", "bonus_splits", "shipments", "invoices", "payments", "applications", "contracts",
                    "contacts", "taxid_candidates", "company_aliases", "companies"]
 
 
@@ -176,6 +176,22 @@ def load(db: DB, res: ParseResult, groups, reset: bool):
         for c in contacts.values():
             db.insert("contacts", c)
 
+        allow = {a["invoice_no"]: a for a in res.allowances}
+        for i in res.invoices:
+            a = allow.get(i.invoice_no, {})
+            db.insert("invoices", {
+                "invoice_no": i.invoice_no, "company_id": None if i.is_void else cid_for(i.company_raw, i.company_name),
+                "company_raw": i.company_raw, "invoice_date": i.invoice_date, "amount_untaxed": i.amount_untaxed,
+                "amount_taxed": i.amount_taxed, "item": i.item, "paid_text": i.paid_text, "paid_date": i.paid_date,
+                "is_received": i.is_received, "is_void": i.is_void, "remarks": i.remarks,
+                "bonus_period": i.bonus_period, "extra": i.extra, "allowance_amount": a.get("amount"),
+                "allowance_date": a.get("date"), "source": "excel", "source_sheet": i.sheet, "source_row": i.row})
+        # 發票號碼對到合約款項；發票清單上已入帳、合約表沒寫入帳的，補上
+        db.run("""update invoices i set payment_id = p.id from payments p
+                  where p.invoice_no = i.invoice_no and i.payment_id is null""")
+        db.run("""update payments p set is_received = true, received_date = coalesce(p.received_date, i.paid_date)
+                  from invoices i where i.payment_id = p.id and i.is_received and not p.is_received""")
+
         for p in res.payouts:
             db.insert("bonus_payouts", {"person": p.person, "period": p.period, "category": p.category,
                                         "amount": p.amount, "note": p.note, "source": "excel",
@@ -200,7 +216,7 @@ def main():
 
     s = summary(res)
     print(f"合約 {s['contracts']} 筆（{s['by_sheet']}）、寄件 {s['shipments']} 筆、季獎金 {s['payouts']} 筆、"
-          f"公司 {len(groups)} 家、名稱合併 {len(merges)} 筆、重複合約合併 {len(dup)} 筆、無法解析 {s['issues']} 個值")
+          f"發票 {s['invoices']} 張、折讓 {s['allowances']} 筆、公司 {len(groups)} 家、名稱合併 {len(merges)} 筆、重複合約合併 {len(dup)} 筆、無法解析 {s['issues']} 個值")
     if s["skipped"]:
         print("略過的工作表：", s["skipped"])
     print(f"報表：{args.report}")

@@ -147,6 +147,36 @@ create index if not exists payments_contract_idx on payments (contract_id);
 alter table payments add column if not exists is_received boolean not null default false;
 alter table payments add column if not exists application_id bigint references applications(id) on delete set null;
 
+-- 發票清單（原「109發票」～「115發票」、「發票_二聯」、「折讓」）：所有開出的發票，含非合約收入
+create table if not exists invoices (
+    id              bigserial primary key,
+    invoice_no      text not null,
+    company_id      bigint references companies(id) on delete set null,
+    company_raw     text,
+    payment_id      bigint references payments(id) on delete set null,  -- 對到合約款項
+    invoice_date    date,
+    amount_untaxed  numeric,
+    amount_taxed    numeric,
+    item            text,                              -- 個案簽約金／過案期中款／補助案尾款／訓練課程…
+    paid_text       text,                              -- 付款日欄原文
+    paid_date       date,
+    is_received     boolean not null default false,
+    is_void         boolean not null default false,
+    allowance_amount numeric,                          -- 折讓金額（未稅）
+    allowance_date  date,
+    remarks         text,
+    bonus_period    text,                              -- 115 1Q：獎金發放季
+    extra           text,
+    source          text not null default 'manual',
+    source_sheet    text,
+    source_row      int,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now()
+);
+create index if not exists invoices_no_idx on invoices (invoice_no);
+create index if not exists invoices_company_idx on invoices (company_id);
+create index if not exists invoices_date_idx on invoices (invoice_date);
+
 -- 合約／發票寄送與用印紀錄（原「合約追蹤」）
 create table if not exists shipments (
     id              bigserial primary key,
@@ -220,7 +250,7 @@ create table if not exists audit_log (
 create or replace function touch_updated_at() returns trigger language plpgsql as $$
 begin new.updated_at = now(); return new; end $$;
 do $$ declare t text; begin
-  foreach t in array array['companies','contracts','payments','applications'] loop
+  foreach t in array array['companies','contracts','payments','applications','invoices'] loop
     execute format('drop trigger if exists %I_touch on %I', t, t);
     execute format('create trigger %I_touch before update on %I for each row execute function touch_updated_at()', t, t);
   end loop;
@@ -258,7 +288,7 @@ where p.is_received and p.invoice_amount is not null;
 -- 讓 anon / authenticated 金鑰無法直接讀取（postgres 連線不受 RLS 影響）。
 do $$ declare t text; begin
   foreach t in array array['companies','company_aliases','taxid_candidates','contacts','staff','app_users',
-                           'contracts','applications','payments','shipments','bonus_splits','bonus_payouts','audit_log'] loop
+                           'contracts','applications','payments','invoices','shipments','bonus_splits','bonus_payouts','audit_log'] loop
     execute format('alter table %I enable row level security', t);
   end loop;
 end $$;

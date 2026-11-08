@@ -4,7 +4,7 @@
 """
 import streamlit as st
 
-from app_pages import admin, companies, contract, work
+from app_pages import admin, companies, contract, data_import, work
 from wisetech import ui
 from wisetech.auth import ROLE_LABEL, current_user, login_screen, logout
 
@@ -35,6 +35,7 @@ def main():
     P["taxid"] = st.Page(admin.taxid_page, title="統編確認", icon="🧾", url_path="taxid")
     P["bonus"] = st.Page(admin.bonus_page, title="獎金績效", icon="🏆", url_path="bonus")
     P["users"] = st.Page(admin.users_page, title="帳號與人員", icon="👤", url_path="users")
+    P["import"] = st.Page(data_import.page, title="資料匯入", icon="📥", url_path="import")
 
     role = user["role"]
     nav = {"查詢": [P["search"], P["company"], P["contracts"], P["contract"]]}
@@ -43,7 +44,7 @@ def main():
     if role in ("admin", "sales"):
         nav.setdefault("獎金", []).append(P["bonus"])
     if role == "admin":
-        nav["管理"] = [P["users"]]
+        nav["管理"] = [P["import"], P["users"]]
 
     with st.sidebar:
         st.markdown(f"**{user['display_name']}**　{ROLE_LABEL[role]}")

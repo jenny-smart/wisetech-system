@@ -26,7 +26,7 @@ NON_COMPANY_HINTS = ("工作室", "社團法人", "財團法人", "協會", "大
                      "行號", "食品行", "餐坊", "企業社", "浮潛行", "研究社", "委員會")
 
 
-def run(db: DB, statuses: tuple[str, ...], limit: int | None, delay: float):
+def run(db: DB, statuses: tuple[str, ...], limit: int | None, delay: float, log=print, progress=None):
     rows = db.all("select id, name from companies where tax_id is null and tax_id_status = any(%s) order by id"
                   + (f" limit {int(limit)}" if limit else ""), (list(statuses),))
     stats = {"auto": 0, "candidate": 0, "not_found": 0, "error": 0}
@@ -35,7 +35,7 @@ def run(db: DB, statuses: tuple[str, ...], limit: int | None, delay: float):
         try:
             hits = search_by_name(name)
         except Exception as e:  # noqa: BLE001
-            print(f"[{i}/{len(rows)}] {name}：查詢失敗 {e}")
+            log(f"[{i}/{len(rows)}] {name}：查詢失敗 {e}")
             stats["error"] += 1
             continue
         verdict, hit = decide(hits)
@@ -62,10 +62,13 @@ def run(db: DB, statuses: tuple[str, ...], limit: int | None, delay: float):
                 verdict = "not_found"
         stats[verdict] += 1
         shown = f"{hit.tax_id} {hit.name}" if hit else f"{len(hits)} 個候選"
-        print(f"[{i}/{len(rows)}] {name} → {verdict}（{shown}）")
+        log(f"[{i}/{len(rows)}] {name} → {verdict}（{shown}）")
+        if progress:
+            progress(i, len(rows))
         time.sleep(delay)
-    print(f"\n完成：自動 {stats['auto']}、待確認 {stats['candidate']}、查無 {stats['not_found']}、失敗 {stats['error']}")
-    print("請到系統的「統編確認」頁處理待確認與查無的公司。")
+    log(f"完成：自動 {stats['auto']}、待確認 {stats['candidate']}、查無 {stats['not_found']}、失敗 {stats['error']}")
+    log("請到系統的「統編確認」頁處理待確認與查無的公司。")
+    return stats
 
 
 def main():

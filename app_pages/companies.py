@@ -61,7 +61,7 @@ def detail_page():
     m[3].metric("已入帳", money(c["received_total"]))
     m[4].metric("未入帳", money(c["outstanding_total"]))
 
-    tabs = st.tabs(["📄 合約", "💰 款項", "📮 寄件／用印", "👤 聯絡人", "⚙️ 公司資料"])
+    tabs = st.tabs(["📄 合約", "💰 款項", "🧾 發票", "📮 寄件／用印", "👤 聯絡人", "⚙️ 公司資料"])
 
     with tabs[0]:
         ks = sv.contracts_of(db, cid)
@@ -88,13 +88,22 @@ def detail_page():
                      column_config={"撥款金額": MONEY_COL, "發票金額": MONEY_COL})
 
     with tabs[2]:
+        inv = sv.invoices_of(db, cid)
+        st.dataframe(frame(inv, {"invoice_date": "發票日", "invoice_no": "發票號碼", "amount_untaxed": "未稅",
+                                 "amount_taxed": "含稅", "item": "項目", "contract_no": "合約",
+                                 "is_received": "已入帳", "paid_text": "付款日", "remarks": "備註",
+                                 "allowance_amount": "折讓"}),
+                     hide_index=True, width="stretch",
+                     column_config={"未稅": MONEY_COL, "含稅": MONEY_COL, "折讓": MONEY_COL})
+
+    with tabs[3]:
         sh = sv.shipments_of(db, cid)
         st.dataframe(frame(sh, {"sent_date": "寄出日", "method": "方式", "purpose": "用途", "contract_ref": "合約",
                                 "party_a_stamp": "甲方用印", "our_stamp": "我方用印", "copies": "份數",
                                 "return_status": "寄回狀態", "invoice_status": "發票", "contact": "收件人",
                                 "address": "地址"}), hide_index=True, width="stretch")
 
-    with tabs[3]:
+    with tabs[4]:
         rows = sv.contacts(db, cid)
         df = frame(rows, {"id": "id", "name": "姓名", "phone": "電話", "email": "Email", "address": "地址",
                           "note": "備註", "last_seen": "最近往來"})
@@ -108,7 +117,7 @@ def detail_page():
         else:
             st.dataframe(df.drop(columns=["id"], errors="ignore"), hide_index=True, width="stretch")
 
-    with tabs[4]:
+    with tabs[5]:
         _company_form(db, c)
         st.markdown("**Excel 上出現過的寫法**")
         st.write("、".join(a["alias"] for a in sv.aliases(db, cid)) or "—")
